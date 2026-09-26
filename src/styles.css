@@ -180,3 +180,12 @@
 @media (prefers-reduced-motion: no-preference) {
   .scanline { animation: scanline 8s linear infinite; }
 }
+
+.leaflet-pane,
+.leaflet-control {
+  z-index: 0 !important;
+}
+
+.leaflet-tile-pane {
+  filter: saturate(0.72) contrast(1.14) brightness(0.62);
+}
