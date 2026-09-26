@@ -1,6 +1,6 @@
 import "maplibre-gl/dist/maplibre-gl.css";
 
-import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
+import { Map as MapLibreMap } from "maplibre-gl";
 import { Crosshair, LocateFixed, Minus, Plus, ScanLine } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -10,7 +10,7 @@ type GeoMapProps = {
   processed: boolean;
   processing: boolean;
   region: string;
-  layers: Record<string, boolean>;
+  layers: { uncertainty: boolean; ndvi: boolean; ndwi: boolean; extraction: boolean };
   drawMode: "box" | "polygon" | null;
   onDrawComplete: () => void;
 };
@@ -26,6 +26,8 @@ const rasterTiles = [
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
 ];
 
+const defaultRegion = { center: [73.7898, 20.011] as [number, number], zoom: 12.5 };
+
 export function GeoMap({ processed, processing, region, layers, drawMode, onDrawComplete }: GeoMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -34,8 +36,8 @@ export function GeoMap({ processed, processing, region, layers, drawMode, onDraw
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
-    const config = regions[region] ?? regions["Nashik Border Zone"];
-    const map = new maplibregl.Map({
+    const config = regions[region] ?? defaultRegion;
+    const map = new MapLibreMap({
       container: containerRef.current,
       center: config.center,
       zoom: config.zoom,
@@ -54,7 +56,7 @@ export function GeoMap({ processed, processing, region, layers, drawMode, onDraw
 
   useEffect(() => {
     const map = mapRef.current;
-    const config = regions[region] ?? regions["Nashik Border Zone"];
+    const config = regions[region] ?? defaultRegion;
     map?.flyTo({ center: config.center, zoom: config.zoom, duration: 1100 });
   }, [region]);
 
@@ -112,7 +114,7 @@ export function GeoMap({ processed, processing, region, layers, drawMode, onDraw
       <div className="absolute bottom-14 right-4 z-30 grid gap-1">
         <Button size="icon" variant="outline" aria-label="Zoom in" onClick={() => mapRef.current?.zoomIn()}><Plus className="size-4" /></Button>
         <Button size="icon" variant="outline" aria-label="Zoom out" onClick={() => mapRef.current?.zoomOut()}><Minus className="size-4" /></Button>
-        <Button size="icon" variant="outline" aria-label="Recenter map" onClick={() => mapRef.current?.flyTo(regions[region] ?? regions["Nashik Border Zone"])}><LocateFixed className="size-4" /></Button>
+        <Button size="icon" variant="outline" aria-label="Recenter map" onClick={() => mapRef.current?.flyTo(regions[region] ?? defaultRegion)}><LocateFixed className="size-4" /></Button>
       </div>
       <div className="absolute bottom-14 left-4 flex items-center gap-2 rounded border border-border bg-background/85 px-2 py-1 font-mono text-[9px] text-muted-foreground">
         <Crosshair className="size-3 text-primary" /> 20°00'39.6&quot;N · 73°47'23.3&quot;E <span className="text-info">Z12.5</span>
