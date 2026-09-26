@@ -1,6 +1,6 @@
 import "maplibre-gl/dist/maplibre-gl.css";
 
-import { Map as MapLibreMap } from "maplibre-gl";
+import { Map as MapLibreMap, setWorkerUrl } from "maplibre-gl";
 import { Crosshair, LocateFixed, Minus, Plus, ScanLine } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -27,6 +27,8 @@ const rasterTiles = [
 ];
 
 const defaultRegion = { center: [73.7898, 20.011] as [number, number], zoom: 12.5 };
+
+setWorkerUrl("/maplibre-gl-worker.mjs");
 
 export function GeoMap({ processed, processing, region, layers, drawMode, onDrawComplete }: GeoMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
