@@ -1,6 +1,6 @@
-import "maplibre-gl/dist/maplibre-gl.css";
+import "leaflet/dist/leaflet.css";
 
-import { Map as MapLibreMap, setWorkerUrl } from "maplibre-gl";
+import L, { type Map as LeafletMap } from "leaflet";
 import { Crosshair, LocateFixed, Minus, Plus, ScanLine } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -22,36 +22,21 @@ const regions: Record<string, { center: [number, number]; zoom: number }> = {
   "Custom AOI": { center: [75.7, 20.6], zoom: 7 },
 };
 
-const rasterTiles = [
-  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-];
+const rasterTiles = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
 
 const defaultRegion = { center: [73.7898, 20.011] as [number, number], zoom: 12.5 };
 
-setWorkerUrl("/maplibre-gl-worker.mjs");
-
 export function GeoMap({ processed, processing, region, layers, drawMode, onDrawComplete }: GeoMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<MapLibreMap | null>(null);
+  const mapRef = useRef<LeafletMap | null>(null);
   const [split, setSplit] = useState(processed ? 52 : 88);
   const [drawing, setDrawing] = useState(false);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
     const config = regions[region] ?? defaultRegion;
-    const map = new MapLibreMap({
-      container: containerRef.current,
-      center: config.center,
-      zoom: config.zoom,
-      attributionControl: false,
-      style: {
-        version: 8,
-        sources: { satellite: { type: "raster", tiles: rasterTiles, tileSize: 256 } },
-        layers: [
-          { id: "satellite", type: "raster", source: "satellite", paint: { "raster-saturation": -0.35, "raster-contrast": 0.32, "raster-brightness-max": 0.72 } },
-        ],
-      },
-    });
+    const map = L.map(containerRef.current, { zoomControl: false, attributionControl: false }).setView([config.center[1], config.center[0]], config.zoom);
+    L.tileLayer(rasterTiles, { maxZoom: 19 }).addTo(map);
     mapRef.current = map;
     return () => { map.remove(); mapRef.current = null; };
   }, []);
@@ -59,7 +44,7 @@ export function GeoMap({ processed, processing, region, layers, drawMode, onDraw
   useEffect(() => {
     const map = mapRef.current;
     const config = regions[region] ?? defaultRegion;
-    map?.flyTo({ center: config.center, zoom: config.zoom, duration: 1100 });
+    map?.flyTo([config.center[1], config.center[0]], config.zoom, { duration: 1.1 });
   }, [region]);
 
   useEffect(() => {
@@ -116,7 +101,7 @@ export function GeoMap({ processed, processing, region, layers, drawMode, onDraw
       <div className="absolute bottom-14 right-4 z-30 grid gap-1">
         <Button size="icon" variant="outline" aria-label="Zoom in" onClick={() => mapRef.current?.zoomIn()}><Plus className="size-4" /></Button>
         <Button size="icon" variant="outline" aria-label="Zoom out" onClick={() => mapRef.current?.zoomOut()}><Minus className="size-4" /></Button>
-        <Button size="icon" variant="outline" aria-label="Recenter map" onClick={() => mapRef.current?.flyTo(regions[region] ?? defaultRegion)}><LocateFixed className="size-4" /></Button>
+        <Button size="icon" variant="outline" aria-label="Recenter map" onClick={() => { const c = regions[region] ?? defaultRegion; mapRef.current?.flyTo([c.center[1], c.center[0]], c.zoom); }}><LocateFixed className="size-4" /></Button>
       </div>
       <div className="absolute bottom-14 left-4 flex items-center gap-2 rounded border border-border bg-background/85 px-2 py-1 font-mono text-[9px] text-muted-foreground">
         <Crosshair className="size-3 text-primary" /> 20°00'39.6&quot;N · 73°47'23.3&quot;E <span className="text-info">Z12.5</span>
