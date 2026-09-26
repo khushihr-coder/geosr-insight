@@ -1,10 +1,4 @@
-<!-- LOVABLE:BEGIN -->
-> [!IMPORTANT]
-> This project is connected to [Lovable](https://lovable.dev). Avoid rewriting
-> published git history — force pushing, or rebasing/amending/squashing commits
-> that are already pushed — as it rewrites history on Lovable's side and the
-> user will likely lose their project history.
->
-> Commits you push to the connected branch sync back to Lovable and show up in
-> the editor, so keep the branch in a working state.
-<!-- LOVABLE:END -->
+# Technical Decisions
+
+- Use MapLibre GL with an Esri World Imagery raster source and synchronized clipped layers for the interactive comparison map; this provides real map navigation without requiring project credentials.
+- Keep the 2.5-second processing workflow and exports client-side with deterministic mock data; the requested experience explicitly requires no live backend.
