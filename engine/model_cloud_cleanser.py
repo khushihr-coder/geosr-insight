@@ -13,12 +13,15 @@ class ConvBlock(nn.Module):
             nn.BatchNorm2d(out_c),
             nn.LeakyReLU(0.2, inplace=True)
         )
+
     def forward(self, x):
         return self.conv(x)
 
-class CrossAttentionFusion(nn.Module):
+class EfficientCrossAttention(nn.Module):
     def __init__(self, channels):
         super().__init__()
+        self.channels = channels
+        self.pool = nn.AdaptiveAvgPool2d((16, 16))
         self.q = nn.Conv2d(channels, channels // 4, kernel_size=1)
         self.k = nn.Conv2d(channels, channels // 4, kernel_size=1)
         self.v = nn.Conv2d(channels, channels, kernel_size=1)
@@ -26,12 +29,16 @@ class CrossAttentionFusion(nn.Module):
 
     def forward(self, opt_feat, sar_feat):
         B, C, H, W = opt_feat.shape
-        Q = self.q(opt_feat).view(B, -1, H * W).permute(0, 2, 1)
-        K = self.k(sar_feat).view(B, -1, H * W)
-        V = self.v(sar_feat).view(B, -1, H * W).permute(0, 2, 1)
+        opt_pooled = self.pool(opt_feat)
+        sar_pooled = self.pool(sar_feat)
+        
+        q = self.q(opt_pooled).flatten(2).transpose(1, 2)
+        k = self.k(sar_pooled).flatten(2)
+        v = self.v(sar_pooled).flatten(2).transpose(1, 2)
 
-        attn = F.softmax(torch.bmm(Q, K) / ((C // 4) ** 0.5), dim=-1)
-        out = torch.bmm(attn, V).permute(0, 2, 1).view(B, C, H, W)
+        attn = F.softmax(torch.bmm(q, k) / ((C // 4) ** 0.5), dim=-1)
+        out = torch.bmm(attn, v).transpose(1, 2).view(B, C, 16, 16)
+        out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
         return self.proj(out) + opt_feat
 
 class SAROpticalCloudCleanser(nn.Module):
@@ -43,7 +50,7 @@ class SAROpticalCloudCleanser(nn.Module):
         self.sar_enc1 = ConvBlock(2, 32)
         self.sar_enc2 = ConvBlock(32, 64)
 
-        self.cross_attn = CrossAttentionFusion(64)
+        self.cross_attn = EfficientCrossAttention(64)
 
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.dec2 = ConvBlock(64 + 32, 32)
@@ -71,14 +78,11 @@ class CloudCleanserLoss(nn.Module):
         super().__init__()
         self.l1 = nn.L1Loss()
         
-    def forward(self, pred, target, eps=1e-8):
+    def forward(self, pred, target, eps=1e-7):
         l1_loss = self.l1(pred, target)
-        
-        # Spectral Angle Mapper (SAM) Loss
         dot = torch.sum(pred * target, dim=1)
-        norm_p = torch.norm(pred, dim=1)
-        norm_t = torch.norm(target, dim=1)
-        cos_theta = torch.clamp(dot / (norm_p * norm_t + eps), -1.0 + eps, 1.0 - eps)
+        norm_p = torch.clamp(torch.norm(pred, dim=1), min=eps)
+        norm_t = torch.clamp(torch.norm(target, dim=1), min=eps)
+        cos_theta = torch.clamp(dot / (norm_p * norm_t), -1.0 + eps, 1.0 - eps)
         sam_loss = torch.mean(torch.acos(cos_theta))
-
         return l1_loss + 0.15 * sam_loss

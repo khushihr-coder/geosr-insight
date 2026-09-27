@@ -35,3 +35,19 @@ dist-ssr
 engine/checkpoints/
 engine/data/raw/
 __pycache__/
+
+# Ignore images
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+engine/outputs/
+
+# Ignore models and datasets
+*.pth
+*.pt
+*.npz
+*.npy
+engine/checkpoints/
+engine/data/

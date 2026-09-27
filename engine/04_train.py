@@ -6,17 +6,16 @@ from tqdm import tqdm
 from dataset import CloudRemovalDataset
 from model_cloud_cleanser import SAROpticalCloudCleanser, CloudCleanserLoss
 
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 EPOCHS = 15
 LEARNING_RATE = 2e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SAVE_DIR = "checkpoints"
+SAVE_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 def train():
-    print(f"[*] Starting Cloud Removal Model Training on: {DEVICE}")
+    print(f"[*] Training on: {DEVICE}")
     train_loader = DataLoader(CloudRemovalDataset(is_train=True), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(CloudRemovalDataset(is_train=False), batch_size=BATCH_SIZE, shuffle=False)
 
     model = SAROpticalCloudCleanser().to(DEVICE)
     criterion = CloudCleanserLoss().to(DEVICE)
@@ -38,10 +37,9 @@ def train():
             total_loss += loss.item()
             pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-        # Save latest checkpoint
         ckpt_path = os.path.join(SAVE_DIR, "cloud_cleanser_latest.pth")
         torch.save(model.state_dict(), ckpt_path)
-        print(f"--> Epoch {epoch} complete. Checkpoint saved to {ckpt_path}")
+        print(f"--> Epoch {epoch} complete. Saved to {ckpt_path}")
 
 if __name__ == "__main__":
     train()
