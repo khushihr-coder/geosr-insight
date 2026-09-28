@@ -2,6 +2,65 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# =====================================================================
+# 1. Temporal 10-Channel U-Net (Matches Kaggle auraclear_weights.pth)
+# =====================================================================
+class CloudCleanserUNet(nn.Module):
+    def __init__(self, in_channels=10, out_channels=4):
+        super(CloudCleanserUNet, self).__init__()
+        
+        # Encoder (Downsampling)
+        self.enc1 = self.conv_block(in_channels, 64)
+        self.enc2 = self.conv_block(64, 128)
+        self.pool = nn.MaxPool2d(2)
+        
+        # Bottleneck
+        self.bottleneck = self.conv_block(128, 256)
+        
+        # Decoder (Upsampling)
+        self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.dec1 = self.conv_block(256, 128) 
+        
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec2 = self.conv_block(128, 64)
+        
+        # Final Output Layer
+        self.final = nn.Conv2d(64, out_channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid() 
+
+    def conv_block(self, in_c, out_c):
+        return nn.Sequential(
+            nn.Conv2d(in_c, out_c, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_c, out_c, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        
+        # Bottleneck
+        b = self.bottleneck(self.pool(e2))
+        
+        # Decoder with Skip Connections
+        d1 = self.up1(b)
+        d1 = torch.cat([d1, e2], dim=1)
+        d1 = self.dec1(d1)
+        
+        d2 = self.up2(d1)
+        d2 = torch.cat([d2, e1], dim=1)
+        d2 = self.dec2(d2)
+        
+        return self.sigmoid(self.final(d2))
+
+
+# =====================================================================
+# 2. Dual-Stream Cross-Attention Architecture & Losses
+# =====================================================================
 class ConvBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
@@ -16,6 +75,7 @@ class ConvBlock(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
 
 class EfficientCrossAttention(nn.Module):
     def __init__(self, channels):
@@ -40,6 +100,7 @@ class EfficientCrossAttention(nn.Module):
         out = torch.bmm(attn, v).transpose(1, 2).view(B, C, 16, 16)
         out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
         return self.proj(out) + opt_feat
+
 
 class SAROpticalCloudCleanser(nn.Module):
     def __init__(self):
@@ -72,6 +133,7 @@ class SAROpticalCloudCleanser(nn.Module):
         d1 = torch.cat([d1, o1], dim=1)
         d2 = self.dec2(d1)
         return self.dec_out(d2)
+
 
 class CloudCleanserLoss(nn.Module):
     def __init__(self):
