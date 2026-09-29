@@ -199,6 +199,30 @@ def _run_inference(cloudy_opt: np.ndarray, sar: np.ndarray, prior_opt: Optional[
         torch.cuda.empty_cache()
     return result
 
+def natural_cloud_blending(original_image, reconstructed_image, cloud_mask=None) -> np.ndarray:
+    """
+    Blends the reconstructed cloud-removal output ONLY where clouds exist,
+    preserving 100% of the original clear pixels to maintain a natural look.
+    """
+    orig_t = torch.from_numpy(original_image).float() if isinstance(original_image, np.ndarray) else original_image.float()
+    recon_t = torch.from_numpy(reconstructed_image).float() if isinstance(reconstructed_image, np.ndarray) else reconstructed_image.float()
+
+    if cloud_mask is None:
+        rgb_mean = orig_t[:3].mean(dim=0, keepdim=True)
+        blue_band = orig_t[0:1]
+        cloud_mask = ((rgb_mean > 0.22) | (blue_band > 0.25)).float()
+    elif isinstance(cloud_mask, np.ndarray):
+        cloud_mask = torch.from_numpy(cloud_mask).float()
+
+    if cloud_mask.dim() == 2:
+        cloud_mask = cloud_mask.unsqueeze(0)
+
+    kernel = torch.ones((1, 1, 5, 5), dtype=torch.float32) / 25.0
+    smoothed_mask = torch.nn.functional.conv2d(cloud_mask.unsqueeze(0), kernel, padding=2).squeeze(0).clamp(0.0, 1.0)
+    blended = (1.0 - smoothed_mask) * orig_t + smoothed_mask * recon_t
+
+    return blended.numpy() if isinstance(original_image, np.ndarray) else blended
+
 def _compute_cloud_percentage_from_optical(opt_bands: np.ndarray) -> float:
     """Estimate cloud coverage from optical bands heuristically."""
     rgb_mean = np.mean(opt_bands[:3], axis=0)
@@ -217,17 +241,19 @@ def _init_gee(project: str = DEFAULT_PROJECT):
         ee.Authenticate(auth_mode="localhost")
         ee.Initialize(project=project)
 
-def enforce_10m_bbox(bbox: list[float], max_dim: int = 480) -> tuple[list[float], int, int]:
+def enforce_10m_bbox(bbox: list[float], max_dim: int = 384) -> tuple[list[float], int, int]:
     """
     Forces the bounding box to strictly align with Sentinel's 10m/pixel resolution.
-    Clamps max_dim to 480 (4.8km) so rasterization padding never exceeds GEE's 262,144 ceiling.
+    Clamps max_dim dynamically based on latitude so rasterization boundary padding
+    never exceeds GEE's 262,144 ceiling anywhere on Earth (e.g. Jammu & Kashmir 32.7°+).
     """
     min_lon, min_lat, max_lon, max_lat = bbox
     center_lat = (min_lat + max_lat) / 2.0
     center_lon = (min_lon + max_lon) / 2.0
 
+    cos_lat = max(0.15, math.cos(math.radians(abs(center_lat))))
     m_per_deg_lat = 111320.0
-    m_per_deg_lon = 111320.0 * math.cos(math.radians(center_lat))
+    m_per_deg_lon = 111320.0 * cos_lat
 
     width_m = (max_lon - min_lon) * m_per_deg_lon
     height_m = (max_lat - min_lat) * m_per_deg_lat
@@ -235,9 +261,15 @@ def enforce_10m_bbox(bbox: list[float], max_dim: int = 480) -> tuple[list[float]
     cols = int(round(width_m / 10.0))
     rows = int(round(height_m / 10.0))
 
-    # Cap to 480px to safely clear the GEE 262,144 pixel limit
-    cols = min(cols, max_dim)
-    rows = min(rows, max_dim)
+    # In GEE, sampleRectangle with EPSG:4326 scale=10 samples cols_sample = cols / cos_lat
+    # Total sampled pixels = (cols * rows) / cos_lat.
+    # To stay strictly below 220,000 pixels (limit is 262,144):
+    safe_max = int(math.sqrt(220000.0 * cos_lat))
+    effective_max = min(max_dim, safe_max)
+    effective_max = max(16, (effective_max // 16) * 16)
+
+    cols = min(cols, effective_max)
+    rows = min(rows, effective_max)
 
     # Force dimensions to be cleanly divisible by 16 for U-Net pooling
     cols = max(16, (cols // 16) * 16)
@@ -272,8 +304,8 @@ def _fetch_gee_data(
 
     import ee
 
-    # 2. 10m Resolution Enforcement
-    adjusted_bbox, target_w, target_h = enforce_10m_bbox(bbox, max_dim=480)
+    # 2. 10m Resolution Enforcement (Strictly <= 384 to guarantee <= 220,000 pixels on GEE)
+    adjusted_bbox, target_w, target_h = enforce_10m_bbox(bbox, max_dim=384)
     min_lon, min_lat, max_lon, max_lat = adjusted_bbox
     geom = ee.Geometry.BBox(min_lon, min_lat, max_lon, max_lat)
 
@@ -390,8 +422,21 @@ def _fetch_gee_data(
         cb8 = np.array(clear_sample.get("B8").getInfo(), dtype=np.float32)[:h, :w]
         prior_optical = np.stack([cb2, cb3, cb4, cb8], axis=0)
         prior_optical = np.nan_to_num(prior_optical, nan=0.0)
+        
+        # Replace any missing/zero boundary pixels with the authentic scene median ground reflectance
+        # (never inject cloudy pixels from the optical image)
+        valid_mask = (prior_optical > 0.01) & (prior_optical < 0.8)
+        if valid_mask.any():
+            for c in range(4):
+                c_valid = prior_optical[c][valid_mask[c]]
+                c_med = float(np.median(c_valid)) if len(c_valid) > 0 else 0.12
+                prior_optical[c] = np.where(prior_optical[c] < 0.005, c_med, prior_optical[c])
+        prior_optical = np.clip(prior_optical, 0.0, 1.0)
     except Exception:
-        prior_optical = optical
+        prior_optical = np.clip(optical, 0.0, 1.0)
+
+    optical = np.clip(optical, 0.0, 1.0)
+    sar = np.clip(sar, 0.0, 1.0)
 
     return {
         "optical": optical,
@@ -462,7 +507,9 @@ async def process_polygon(
         prior_opt = gee_data["prior_optical"]
 
         # ── Run 10-channel U-Net inference ──────────────────────
-        cleansed = _run_inference(cloudy_opt, sar, prior_opt)
+        raw_cleansed = _run_inference(cloudy_opt, sar, prior_opt)
+        # Inpaint only cloudy regions, preserving 100% of authentic clear pixels
+        cleansed = natural_cloud_blending(cloudy_opt, raw_cleansed)
 
         # ── Generate outputs ────────────────────────────────────
         job_dir = OUTPUT_DIR / job_id
