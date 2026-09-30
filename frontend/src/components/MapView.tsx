@@ -16,6 +16,9 @@ import {
 import type { SatelliteScene } from '../data/mockData';
 
 interface MapViewProps {
+  coordinates?: string;
+  onCoordinatesChange?: (coords: string) => void;
+  isMarkMode?: boolean;
   selectedScene?: SatelliteScene;
   activeBaseLayer?: 'Satellite Imagery' | 'Grayscale' | 'Hybrid';
   layerToggles?: {
@@ -27,7 +30,60 @@ interface MapViewProps {
   };
 }
 
+// Parse string representation into Leaflet Lat/Lon pairs [[lat, lon], ...]
+function parseToLeafletCoords(coordsStr?: string): [number, number][] {
+  if (!coordsStr) {
+    return [
+      [32.70, 75.85],
+      [32.70, 75.93],
+      [32.78, 75.93],
+      [32.78, 75.85],
+    ];
+  }
+  try {
+    const trimmed = coordsStr.trim();
+    if (trimmed.startsWith('[')) {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed) && parsed.length >= 3) {
+        // [ [lon, lat], ... ]
+        return parsed.map((pt: number[]) => [pt[1], pt[0]] as [number, number]);
+      } else if (Array.isArray(parsed) && parsed.length === 4) {
+        // [minLon, minLat, maxLon, maxLat]
+        const [minLon, minLat, maxLon, maxLat] = parsed;
+        return [
+          [minLat, minLon],
+          [minLat, maxLon],
+          [maxLat, maxLon],
+          [maxLat, minLon],
+        ];
+      }
+    } else {
+      const parts = trimmed.split(',').map((s) => parseFloat(s.trim()));
+      if (parts.length === 4 && !parts.some(isNaN)) {
+        const [minLon, minLat, maxLon, maxLat] = parts;
+        return [
+          [minLat, minLon],
+          [minLat, maxLon],
+          [maxLat, maxLon],
+          [maxLat, minLon],
+        ];
+      }
+    }
+  } catch {
+    // Return standard coordinates if malformed while typing
+  }
+  return [
+    [32.70, 75.85],
+    [32.70, 75.93],
+    [32.78, 75.93],
+    [32.78, 75.85],
+  ];
+}
+
 export const MapView: React.FC<MapViewProps> = ({
+  coordinates,
+  onCoordinatesChange,
+  isMarkMode = false,
   selectedScene,
   activeBaseLayer = 'Satellite Imagery',
   layerToggles = {
@@ -69,12 +125,23 @@ export const MapView: React.FC<MapViewProps> = ({
 
     mapInstanceRef.current = map;
 
-    // Default Esri World Imagery (Satellite)
+    // 1. High-Reliability Underlying Base Layer (Guarantees map NEVER renders black)
+    L.tileLayer(
+      'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+      {
+        subdomains: 'abcd',
+        maxZoom: 20,
+        attribution: '&copy; CartoDB &copy; OpenStreetMap',
+      }
+    ).addTo(map);
+
+    // 2. High-Resolution Esri World Imagery (Satellite) with safe maxNativeZoom
     const tileLayer = L.tileLayer(
       'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
       {
         maxZoom: 19,
-        attribution: 'Tiles &copy; Esri &mdash; GeoSR-Insight',
+        maxNativeZoom: 18,
+        attribution: 'Tiles &copy; Esri &mdash; GeoLens Engine',
       }
     ).addTo(map);
 
@@ -88,11 +155,59 @@ export const MapView: React.FC<MapViewProps> = ({
     const overlayGroup = L.layerGroup().addTo(map);
     overlayGroupRef.current = overlayGroup;
 
+    // Trigger initial invalidateSize to ensure tiles load immediately
+    setTimeout(() => {
+      map.invalidateSize();
+    }, 100);
+
     return () => {
       map.remove();
       mapInstanceRef.current = null;
     };
   }, []);
+
+  // Ensure map size is recalculated when coordinates or marking mode changes
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      mapInstanceRef.current?.invalidateSize();
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [coordinates, isMarkMode]);
+
+  // Map Click Listener for interactive coordinate marking
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+
+    const handleMapClick = (e: L.LeafletMouseEvent) => {
+      // Allow marking if in mark mode OR if marker/polygon GIS tool is active
+      if (isMarkMode || activeGisTool === 'marker' || activeGisTool === 'polygon') {
+        const centerLat = e.latlng.lat;
+        const centerLng = e.latlng.lng;
+
+        // Calculate a safe 8.0 km x 8.0 km bounding box matching the 3x SR benchmark
+        const halfLat = (8.0 / 111.32) / 2;
+        const latCos = Math.cos((centerLat * Math.PI) / 180);
+        const halfLon = (8.0 / (111.32 * (latCos || 1))) / 2;
+
+        const minLat = +(centerLat - halfLat).toFixed(4);
+        const maxLat = +(centerLat + halfLat).toFixed(4);
+        const minLon = +(centerLng - halfLon).toFixed(4);
+        const maxLon = +(centerLng + halfLon).toFixed(4);
+
+        const newFormatted = `[[${minLon}, ${minLat}], [${maxLon}, ${minLat}],\n [${maxLon}, ${maxLat}], [${minLon}, ${maxLat}]]`;
+        
+        if (onCoordinatesChange) {
+          onCoordinatesChange(newFormatted);
+        }
+      }
+    };
+
+    map.on('click', handleMapClick);
+    return () => {
+      map.off('click', handleMapClick);
+    };
+  }, [isMarkMode, activeGisTool, onCoordinatesChange]);
 
   // Update Base Layer
   useEffect(() => {
@@ -104,7 +219,7 @@ export const MapView: React.FC<MapViewProps> = ({
     }
 
     let url = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
-    let options: L.TileLayerOptions = { maxZoom: 19 };
+    let options: L.TileLayerOptions = { maxZoom: 19, maxNativeZoom: 18 };
 
     if (activeBaseLayer === 'Grayscale') {
       url = 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
@@ -115,19 +230,22 @@ export const MapView: React.FC<MapViewProps> = ({
 
     const newTileLayer = L.tileLayer(url, options).addTo(map);
     tileLayerRef.current = newTileLayer;
+    map.invalidateSize();
   }, [activeBaseLayer]);
 
-  // Update AOI Polygon and Corner Handles
+  // Update AOI Polygon and Corner Handles whenever coordinates or selectedScene changes
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map) return;
 
-    const coords: [number, number][] = selectedScene?.polygon || [
-      [32.70, 75.85],
-      [32.70, 75.93],
-      [32.78, 75.93],
-      [32.78, 75.85],
-    ];
+    const coords: [number, number][] = coordinates
+      ? parseToLeafletCoords(coordinates)
+      : selectedScene?.polygon || [
+          [32.70, 75.85],
+          [32.70, 75.93],
+          [32.78, 75.93],
+          [32.78, 75.85],
+        ];
 
     // Remove previous polygon
     if (polygonLayerRef.current) {
@@ -141,7 +259,6 @@ export const MapView: React.FC<MapViewProps> = ({
       opacity: 0.95,
       fillColor: '#2563eb',
       fillOpacity: 0.22,
-      dashArray: undefined,
     }).addTo(map);
 
     polygonLayerRef.current = poly;
@@ -162,9 +279,17 @@ export const MapView: React.FC<MapViewProps> = ({
       });
     }
 
-    // Smoothly pan to the scene
-    map.panTo(poly.getBounds().getCenter(), { animate: true });
-  }, [selectedScene]);
+    // Smoothly fit bounds so the bounding box is ALWAYS visible and centered
+    try {
+      const bounds = poly.getBounds();
+      if (bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [40, 40], maxZoom: 12, animate: true });
+        map.invalidateSize();
+      }
+    } catch {
+      // Ignore boundary calculation issues during rapid typing
+    }
+  }, [coordinates, selectedScene]);
 
   // Update Overlays
   useEffect(() => {
@@ -262,8 +387,21 @@ export const MapView: React.FC<MapViewProps> = ({
 
   return (
     <div className="relative w-full h-[520px] lg:h-[560px] bg-slate-900 rounded-lg overflow-hidden border border-slate-300 shadow-sm select-none">
-      {/* Real Interactive Leaflet Container */}
-      <div ref={mapContainerRef} className="w-full h-full z-0" />
+      {/* Real Interactive Leaflet Container Wrapper to preserve Leaflet classes */}
+      <div className={`absolute inset-0 z-0 ${isMarkMode ? 'cursor-crosshair' : ''}`}>
+        <div
+          ref={mapContainerRef}
+          style={{ width: '100%', height: '100%' }}
+        />
+      </div>
+
+      {/* Mark on Map Mode Indicator Banner */}
+      {isMarkMode && (
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-slate-900/90 text-white px-4 py-1.5 rounded-full shadow-xl border border-blue-500/80 backdrop-blur-md flex items-center space-x-2 text-[12px] font-medium">
+          <MapPin className="h-4 w-4 text-amber-400 animate-bounce" />
+          <span>Click anywhere to place the 3&times; SR Bounding Box (~8.0 km &times; 8.0 km)</span>
+        </div>
+      )}
 
       {/* Floating Left GIS Toolbar */}
       <div className="absolute top-4 left-4 z-10 bg-white/95 backdrop-blur-sm rounded-lg border border-slate-200/90 shadow-lg p-1 flex flex-col space-y-1">
