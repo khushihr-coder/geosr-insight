@@ -216,7 +216,7 @@ export function useCloudCleanser() {
         status: "ok",
         device: "mock",
         model_loaded: true,
-        checkpoint: "cloud_cleanser_latest.pth",
+        checkpoint: "auraclear_weights_v3.pth",
         gpu: {
           cuda_available: true,
           device_name: "RTX 3050 Laptop GPU (mock)",

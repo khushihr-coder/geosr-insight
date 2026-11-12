@@ -78,9 +78,6 @@ def get_model() -> CloudCleanserUNet:
         # Priority order of checkpoints to load
         candidates = [
             CKPT_PATH,
-            ENGINE_DIR / "checkpoints" / "auraclear_weights_v3.pth",
-            ENGINE_DIR / "checkpoints" / "auraclear_weights_v2.pth",
-            ENGINE_DIR / "checkpoints" / "auraclear_weights.pth",
         ]
         loaded = False
         for p in candidates:
@@ -381,7 +378,9 @@ def _fetch_gee_data(
 
     # ── Sample pixels ───────────────────────────────────────────
     # 2. Resample optical & SAR at strictly 10m native resolution
-    stacked = ee.Image.cat([opt_img, sar_img]).clip(geom).reproject(crs='EPSG:4326', scale=10)
+    # Also include the QA60 binary cloud mask so it can be downloaded as pixels
+    cloud_mask_band = cloud_mask_img.rename('CLOUD_MASK').toFloat()
+    stacked = ee.Image.cat([opt_img, sar_img, cloud_mask_band]).clip(geom).reproject(crs='EPSG:4326', scale=10)
     sample = stacked.sampleRectangle(region=geom, defaultValue=0)
     b2 = np.array(sample.get("B2").getInfo(), dtype=np.float32)
     b3 = np.array(sample.get("B3").getInfo(), dtype=np.float32)
@@ -389,6 +388,7 @@ def _fetch_gee_data(
     b8 = np.array(sample.get("B8").getInfo(), dtype=np.float32)
     vv = np.array(sample.get("VV").getInfo(), dtype=np.float32)
     vh = np.array(sample.get("VH").getInfo(), dtype=np.float32)
+    qa60_mask = np.array(sample.get("CLOUD_MASK").getInfo(), dtype=np.float32)
 
     max_dim = 512
     h, w = b2.shape
@@ -396,6 +396,7 @@ def _fetch_gee_data(
     w = min(w, max_dim)
     optical = np.stack([b2[:h, :w], b3[:h, :w], b4[:h, :w], b8[:h, :w]], axis=0)
     sar = np.stack([vv[:h, :w], vh[:h, :w]], axis=0)
+    qa60_cloud_mask = qa60_mask[:h, :w]  # (H, W) binary: 1=cloud, 0=clear
     optical = np.nan_to_num(optical, nan=0.0)
     sar = np.nan_to_num(sar, nan=0.0)
 
@@ -406,9 +407,10 @@ def _fetch_gee_data(
             .filterBounds(geom)
             .filterDate(s2_date.advance(-180, "day"), s2_date.advance(180, "day"))
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 15))
+            .filter(ee.Filter.contains('.geo', geom))
             .sort("CLOUDY_PIXEL_PERCENTAGE")
         )
-        s2_clear_img = s2_clear_col.median()
+        s2_clear_img = s2_clear_col.first()
         clear_sample = (
             s2_clear_img.select(["B2", "B3", "B4", "B8"])
             .divide(10000.0)
@@ -442,6 +444,7 @@ def _fetch_gee_data(
         "optical": optical,
         "sar": sar,
         "prior_optical": prior_optical,
+        "qa60_cloud_mask": qa60_cloud_mask,  # (H, W) binary pixel mask from Sentinel-2 QA60
         "cloud_coverage_percentage": max(pixel_cloud_pct, cloud_pct_meta),
         "acquisition_date_s2": s2_date_str,
         "acquisition_date_s1": s1_date_str,

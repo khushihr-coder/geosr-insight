@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from math import exp
+from torchvision.models import vgg16, VGG16_Weights
 
 # =====================================================================
 # 1. Temporal 10-Channel U-Net (Matches Kaggle auraclear_weights.pth)
@@ -26,7 +28,7 @@ class CloudCleanserUNet(nn.Module):
         
         # Final Output Layer
         self.final = nn.Conv2d(64, out_channels, kernel_size=1)
-        self.sigmoid = nn.Sigmoid() 
+        self.sigmoid = nn.Sigmoid()
 
     def conv_block(self, in_c, out_c):
         return nn.Sequential(
@@ -135,16 +137,117 @@ class SAROpticalCloudCleanser(nn.Module):
         return self.dec_out(d2)
 
 
-class CloudCleanserLoss(nn.Module):
-    def __init__(self):
+# =====================================================================
+# Loss Functions for Training
+# =====================================================================
+
+def gaussian(window_size, sigma):
+    gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
+    return gauss / gauss.sum()
+
+def create_window(window_size, channel):
+    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+    return window
+
+def _ssim(img1, img2, window, window_size, channel, size_average=True):
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size // 2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size // 2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channel) - mu1_mu2
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    if size_average:
+        return ssim_map.mean()
+    else:
+        return ssim_map.mean(1).mean(1).mean(1)
+
+class SSIMLoss(nn.Module):
+    def __init__(self, window_size=11, size_average=True):
+        super(SSIMLoss, self).__init__()
+        self.window_size = window_size
+        self.size_average = size_average
+        self.channel = 1
+        self.window = create_window(window_size, self.channel)
+
+    def forward(self, img1, img2):
+        (_, channel, _, _) = img1.size()
+        if channel == self.channel and self.window.data.type() == img1.data.type():
+            window = self.window
+        else:
+            window = create_window(self.window_size, channel)
+            if img1.is_cuda:
+                window = window.cuda(img1.get_device())
+            window = window.type_as(img1)
+            self.window = window
+            self.channel = channel
+        return 1 - _ssim(img1, img2, window, self.window_size, channel, self.size_average)
+
+
+class SatellitePerceptualLoss(nn.Module):
+    def __init__(self, device='cuda'):
         super().__init__()
-        self.l1 = nn.L1Loss()
+        # Extract features from early & mid VGG layers for texture fidelity
+        vgg = vgg16(weights=VGG16_Weights.DEFAULT).features.to(device).eval()
+        self.slice1 = nn.Sequential(*[vgg[x] for x in range(4)]).eval()   # Relu1_2 (fine textures)
+        self.slice2 = nn.Sequential(*[vgg[x] for x in range(4, 9)]).eval() # Relu2_2 (edges)
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, pred_rgb, target_rgb):
+        # RGB slices normalized to ImageNet stats
+        # We only pass the first 3 channels (RGB) to VGG, excluding NIR
+        pred_rgb_3 = pred_rgb[:, :3, :, :]
+        target_rgb_3 = target_rgb[:, :3, :, :]
         
-    def forward(self, pred, target, eps=1e-7):
-        l1_loss = self.l1(pred, target)
-        dot = torch.sum(pred * target, dim=1)
-        norm_p = torch.clamp(torch.norm(pred, dim=1), min=eps)
-        norm_t = torch.clamp(torch.norm(target, dim=1), min=eps)
-        cos_theta = torch.clamp(dot / (norm_p * norm_t), -1.0 + eps, 1.0 - eps)
-        sam_loss = torch.mean(torch.acos(cos_theta))
-        return l1_loss + 0.15 * sam_loss
+        p_feat1 = self.slice1(pred_rgb_3)
+        t_feat1 = self.slice1(target_rgb_3)
+        p_feat2 = self.slice2(p_feat1)
+        t_feat2 = self.slice2(t_feat1)
+        return F.l1_loss(p_feat1, t_feat1) + F.l1_loss(p_feat2, t_feat2)
+
+def spectral_angle_loss(pred, target):
+    """Enforces identical spectral signature vector directions across channels"""
+    pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-8)
+    target_norm = F.normalize(target, p=2, dim=1, eps=1e-8)
+    cosine_sim = torch.sum(pred_norm * target_norm, dim=1)
+    return torch.mean(1.0 - cosine_sim)
+
+
+class CloudCleanserLoss(nn.Module):
+    def __init__(self, device='cuda'):
+        super().__init__()
+        self.smooth_l1 = nn.SmoothL1Loss(reduction='none') # Change to none to apply mask weighting later
+        self.ssim = SSIMLoss()
+        self.vgg_perc = SatellitePerceptualLoss(device=device)
+        
+    def forward(self, pred, target, cloud_mask=None):
+        """
+        L_total = L_SmoothL1 + 0.5 * L_SSIM + 0.1 * L_VGGPerc + 0.05 * L_Spectral
+        cloud_mask: Optional binary mask (1 for cloud, 0 for clear ground) to apply attention weighting.
+        """
+        # 1. Pixel-wise Loss (Mask Weighted if mask provided)
+        base_l1 = self.smooth_l1(pred, target)
+        if cloud_mask is not None:
+            # Mask-Weighted Loss Attention (Focus Gradients on Clouds)
+            # Multiply loss by 4.0 over the cloud-occluded zones
+            weight_map = 1.0 + 3.0 * cloud_mask 
+            base_l1 = base_l1 * weight_map
+        l1_loss = base_l1.mean()
+        
+        # 2. Structural Similarity Loss
+        ssim_loss = self.ssim(pred, target)
+        
+        # 3. Perceptual Texture Loss
+        perc_loss = self.vgg_perc(pred, target)
+        
+        # 4. Spectral Angle Loss
+        spectral_loss = spectral_angle_loss(pred, target)
+        
+        return l1_loss + 0.5 * ssim_loss + 0.1 * perc_loss + 0.05 * spectral_loss

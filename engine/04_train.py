@@ -27,7 +27,7 @@ def train():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 
     # Resume from existing baseline weights if available
-    old_ckpt_path = os.path.join(SAVE_DIR, "auraclear_weights.pth")
+    old_ckpt_path = os.path.join(SAVE_DIR, "auraclear_weights_v3.pth")
     if os.path.exists(old_ckpt_path):
         model.load_state_dict(torch.load(old_ckpt_path, map_location=DEVICE, weights_only=True))
         print(f"[*] Loaded baseline weights from {old_ckpt_path}. Continuing training...\n")
@@ -44,9 +44,14 @@ def train():
             prior = gt.clone()
             inputs_10ch = torch.cat([c_opt, sar, prior], dim=1)
 
+            # Simple on-the-fly cloud mask for attention weighting
+            # Mean brightness of RGB bands > 0.40
+            brightness = torch.mean(c_opt[:, :3, :, :], dim=1, keepdim=True)
+            cloud_mask = (brightness > 0.40).float()
+
             optimizer.zero_grad()
             pred = model(inputs_10ch)
-            loss = criterion(pred, gt)
+            loss = criterion(pred, gt, cloud_mask=cloud_mask)
             loss.backward()
             optimizer.step()
 
@@ -55,7 +60,6 @@ def train():
 
         new_ckpt_path = os.path.join(SAVE_DIR, "auraclear_weights_v3.pth")
         torch.save(model.state_dict(), new_ckpt_path)
-        torch.save(model.state_dict(), os.path.join(SAVE_DIR, "auraclear_weights_v2.pth"))
         print(f"--> Epoch {epoch} complete. Saved to {new_ckpt_path}")
 
 if __name__ == "__main__":

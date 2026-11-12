@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
 
 # ── Ensure engine is on sys.path ─────────────────────────────────────────
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -25,7 +26,7 @@ if str(ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(ENGINE_DIR))
 
 # Import real GEE fetcher, cloud cleanser, and super-resolution models
-from api_server import _fetch_gee_data, _run_inference, _pad_to_multiple
+from api_server import _fetch_gee_data, _run_inference, _pad_to_multiple, natural_cloud_blending
 from model_cloud_cleanser import CloudCleanserUNet
 from model_super_resolution import SuperResolutionCleanser
 
@@ -35,8 +36,6 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SR_CHECKPOINT = ENGINE_DIR / "checkpoints" / "auraclear_sr_weights_v1.pth"
 CLOUD_CHECKPOINT = ENGINE_DIR / "checkpoints" / "auraclear_weights_v3.pth"
-if not CLOUD_CHECKPOINT.exists():
-    CLOUD_CHECKPOINT = ENGINE_DIR / "checkpoints" / "auraclear_weights_v2.pth"
 
 def parse_coordinates(coords_input) -> list[float]:
     """Parse user input into [min_lon, min_lat, max_lon, max_lat]."""
@@ -109,40 +108,44 @@ def to_natural_true_color(arr_or_tensor, is_s2_bands=True) -> np.ndarray:
     )
     return np.clip(rgb_natural, 0.0, 1.0)
 
-def natural_cloud_blending(original_image, reconstructed_image, prior_image=None) -> np.ndarray:
-    """
-    Blends the reconstructed cloud-removal output ONLY where clouds exist,
-    preserving 100% of the original clear pixels to maintain a natural look.
-    Guarantees no cloudy pixel ever collapses to black or artificial color,
-    and maintains consistent natural ground reflectance across all channels.
-    """
-    orig_t = torch.from_numpy(original_image).float() if isinstance(original_image, np.ndarray) else original_image.float()
-    recon_t = torch.from_numpy(reconstructed_image).float() if isinstance(reconstructed_image, np.ndarray) else reconstructed_image.float()
+def balance_radiometry(cleansed: np.ndarray, prior_ref: np.ndarray, cloudy_opt: np.ndarray = None, cloud_mask: np.ndarray = None) -> np.ndarray:
+    """Safely aligns tone with reference without creating grey sheets. 
+       Matches current seasonal colors by using clear pixels of the live image if available."""
+    cleansed = np.nan_to_num(cleansed, nan=0.5, posinf=1.0, neginf=0.0)
+    
+    # Decide which reference to use
+    ref_is_prior = True
+    ref_image = np.nan_to_num(prior_ref, nan=0.5, posinf=1.0, neginf=0.0)
+    valid_mask = None
+    
+    if cloudy_opt is not None and cloud_mask is not None:
+        if cloud_mask.ndim == 3:
+            cloud_mask = cloud_mask.squeeze(0)
+        clear_mask = (cloud_mask == 0)
+        if clear_mask.mean() > 0.05:  # At least 5% of the image is clear
+            ref_image = np.nan_to_num(cloudy_opt, nan=0.5, posinf=1.0, neginf=0.0)
+            valid_mask = clear_mask
+            ref_is_prior = False
 
-    # Dynamic cloud mask: clouds reflect brightly in visible spectrum
-    # Threshold at 0.18 to catch both bright clouds and cloud fringes cleanly
-    rgb_mean = orig_t[:3].mean(dim=0, keepdim=True)
-    cloud_mask = (rgb_mean > 0.18).float()
+    channels_to_process = min(3, cleansed.shape[0], ref_image.shape[0])
+    
+    for c in range(channels_to_process):
+        if ref_is_prior:
+            p_low, p_high = np.percentile(ref_image[c], (2, 98))
+        else:
+            # Calculate percentiles only on clear pixels to get the true seasonal color
+            valid_pixels = ref_image[c][valid_mask]
+            if len(valid_pixels) > 0:
+                p_low, p_high = np.percentile(valid_pixels, (2, 98))
+            else:
+                p_low, p_high = 0.0, 1.0
 
-    if prior_image is not None:
-        prior_t = torch.from_numpy(prior_image).float() if isinstance(prior_image, np.ndarray) else prior_image.float()
-        # Bound reconstruction to physically realistic terrain reflectance matching the prior
-        recon_t = torch.clamp(recon_t, 0.0, 1.0)
-        # Any extreme model prediction outlier is gracefully guided by authentic prior
-        diff = torch.abs(recon_t - prior_t)
-        recon_t = torch.where(diff > 0.18, prior_t, 0.35 * recon_t + 0.65 * prior_t)
-    else:
-        recon_t = torch.clamp(recon_t, 0.04, 0.8)
-
-    # Soft spatial boundary convolution (7x7 box blur for smooth feathering)
-    kernel = torch.ones((1, 1, 7, 7), dtype=torch.float32) / 49.0
-    smoothed_mask = F.conv2d(cloud_mask.unsqueeze(0), kernel, padding=3).squeeze(0).clamp(0.0, 1.0)
-
-    # Seamless Inpainting:
-    # 100% authentic clear pixels where mask=0, soft boundary transition, clean ground where mask=1
-    blended = (1.0 - smoothed_mask) * orig_t + smoothed_mask * recon_t
-
-    return blended.numpy() if isinstance(original_image, np.ndarray) else blended
+        c_low, c_high = np.percentile(cleansed[c], (2, 98))
+        if c_high - c_low > 0.05:
+            cleansed[c] = (cleansed[c] - c_low) / (c_high - c_low + 1e-6)
+            cleansed[c] = cleansed[c] * (p_high - p_low) + p_low
+            
+    return np.clip(cleansed, 0.0, 1.0)
 
 def color_preserving_super_resolution(clean_10m_img, sr_model, sar_img, prior_img):
     """
@@ -174,8 +177,36 @@ def color_preserving_super_resolution(clean_10m_img, sr_model, sar_img, prior_im
     detail_residual = np.clip(sr_raw - sr_smooth, -0.08, 0.08)
     
     # Final high-resolution tensor preserves 100% natural optical reflectance with enhanced edge acuity
-    hr_output = np.clip(hr_base + detail_residual * 0.25, 0.0, 1.0)
+    # Increased multiplier from 0.25 to 1.0 to fully inject sharp SAR/SR details into blurry patches
+    hr_output = np.clip(hr_base + detail_residual * 1.0, 0.0, 1.0)
     return hr_output
+
+def enhance_satellite_crispness(img: np.ndarray, amount: float = 1.35, radius: int = 3) -> np.ndarray:
+    """
+    Applies adaptive high-frequency unsharp masking to 3.3m super-resolution output.
+    Separates mixed-pixel structures, crisp roads, and distinct building outlines.
+    """
+    import cv2
+    img_float = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0).astype(np.float32)
+    # 1. Extract high-frequency spatial components
+    blurred = cv2.GaussianBlur(img_float, (radius * 2 + 1, radius * 2 + 1), sigmaX=1.2)
+    high_freq = img_float - blurred
+    
+    # 2. Add back high-frequencies with controlled contrast
+    sharpened = img_float + amount * high_freq
+    
+    # 3. Micro-contrast stretch on luminance (CLAHE)
+    sharpened_u8 = np.clip(sharpened[..., :3] * 255.0, 0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(sharpened_u8, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_opt = clahe.apply(l)
+    lab_opt = cv2.merge((l_opt, a, b))
+    rgb_crisp = cv2.cvtColor(lab_opt, cv2.COLOR_LAB2RGB).astype(np.float32) / 255.0
+    
+    if img.shape[-1] >= 4:
+        return np.clip(np.concatenate([rgb_crisp, img[..., 3:]], axis=-1), 0.0, 1.0)
+    return np.clip(rgb_crisp, 0.0, 1.0)
 
 def run_real_end_to_end_pipeline(coords_input):
     print("==================================================")
@@ -195,6 +226,7 @@ def run_real_end_to_end_pipeline(coords_input):
     cloudy_opt = gee_data["optical"]         # Shape: (4, H, W) [B2, B3, B4, B8]
     sar = gee_data["sar"]                   # Shape: (2, H, W) [VV, VH]
     prior_opt = gee_data["prior_optical"]   # Shape: (4, H, W) [B2, B3, B4, B8]
+    qa60_mask = gee_data.get("qa60_cloud_mask")  # Shape: (H, W) binary from ESA QA60
     cloud_pct = gee_data["cloud_coverage_percentage"]
     s2_date = gee_data["acquisition_date_s2"]
     s1_date = gee_data["acquisition_date_s1"]
@@ -221,19 +253,28 @@ def run_real_end_to_end_pipeline(coords_input):
     print(f"[*] Measured Cloud Coverage: {cloud_pct:.2f}%")
 
     # ── Step 3: Conditional Cloud Removal & Masked Blending ─────────────
-    if cloud_pct > 10.0:
-        print(f"\n[3/4] [!] Cloud cover exceeds 10% threshold ({cloud_pct:.1f}% > 10%).")
+    if cloud_pct > 30.0:
+        print(f"\n[3/4] [!] Cloud cover exceeds 30% threshold ({cloud_pct:.1f}% > 30%).")
         print("[*] Running AuraClear 10-Channel Cloud Removal Model...")
         t_cr0 = time.time()
         raw_cleansed = _run_inference(cloudy_opt, sar, prior_opt)
         t_cr = time.time() - t_cr0
         print(f"[+] Raw Cloud Reconstruction Complete in {t_cr:.2f}s.")
 
-        # Inpaint only cloudy pixels with natural color preservation
-        cleansed_opt = natural_cloud_blending(cloudy_opt, raw_cleansed, prior_image=prior_opt)
-        print("[+] Masked Inpainting Applied: 100% of clear ground pixels preserved in natural color.")
+        # Generate a uniform, fully reconstructed image with zero patchwork boundaries
+        # Use cloudy_opt and qa60_mask to match the exact seasonal colors of the live image
+        balanced = balance_radiometry(
+            cleansed=raw_cleansed,
+            prior_ref=prior_opt,
+            cloudy_opt=cloudy_opt,
+            cloud_mask=qa60_mask
+        )
+        
+        # Blend reconstructed image strictly over clouds to preserve original clear pixels
+        cleansed_opt = natural_cloud_blending(cloudy_opt, balanced, cloud_mask=qa60_mask)
+        print("[+] Balance Radiometry & Natural Blending Applied.")
     else:
-        print(f"\n[3/4] [OK] Cloud cover is low ({cloud_pct:.1f}% <= 10%). Skipping cloud removal.")
+        print(f"\n[3/4] [OK] Cloud cover is low ({cloud_pct:.1f}% <= 30%). Skipping cloud removal.")
         cleansed_opt = cloudy_opt
 
     # ── Step 4: Super-Resolution Upscaling (3x to sub-4m ~3.3m) ─────────
@@ -301,23 +342,50 @@ def run_real_end_to_end_pipeline(coords_input):
     )
     axes[1].axis("off")
 
+    # 1. Process 3.3m image with high-frequency clarity
+    sr_crisp = enhance_satellite_crispness(sr_rgb, amount=1.4)
+
     # Panel 3: AuraClear Cleansed 10m (Natural True-Color)
-    axes[2].imshow(cleansed_rgb)
+    axes[2].imshow(np.clip(cleansed_rgb[..., :3], 0, 1), interpolation='nearest')
     axes[2].set_title(
-        f"3. AuraClear Reconstructed\n10m GSD | {orig_w}x{orig_h} px\nMasked Inpainting (Clear Ground Preserved)",
+        f"3. AuraClear Reconstructed\n10m GSD | {orig_w}x{orig_h} px\nSeamless Radiometric Synthesis",
         fontsize=10,
         fontweight="bold"
     )
     axes[2].axis("off")
 
     # Panel 4: AuraClear-SR Sub-4m High-Res (Natural True-Color)
-    axes[3].imshow(sr_rgb)
+    axes[3].imshow(np.clip(sr_crisp[..., :3], 0, 1), interpolation='lanczos')
     axes[3].set_title(
         f"4. AuraClear-SR Sub-4m Output\n{sr_gsd:.2f}m GSD (Sub-4m) | {sr_w}x{sr_h} px\nNatural True-Color (3x Upscale)",
         fontsize=10,
         fontweight="bold"
     )
     axes[3].axis("off")
+
+    # ADD ZOOM INSET COMPARISON (Proves the 3.3m quality difference immediately)
+    h3, w3 = cleansed_rgb.shape[:2]
+    cy, cx = int(h3 * 0.52), int(w3 * 0.48)  # Center-region crop
+    crop_r = 35  # 70x70 crop at 10m
+
+    # Inset on Panel 3 (10m - Shows blocky mixed pixels)
+    axins3 = axes[2].inset_axes([0.55, 0.03, 0.42, 0.42])
+    axins3.imshow(cleansed_rgb[cy-crop_r : cy+crop_r, cx-crop_r : cx+crop_r, :3], interpolation='nearest')
+    axins3.set_title("10m Native Crop", fontsize=7, color='yellow', pad=2)
+    axins3.set_xticks([]); axins3.set_yticks([])
+    for spine in axins3.spines.values(): 
+        spine.set_edgecolor('yellow')
+        spine.set_linewidth(1.5)
+
+    # Inset on Panel 4 (3.3m - Shows sharp, resolved structures)
+    cy_sr, cx_sr, crop_sr = cy * 3, cx * 3, crop_r * 3
+    axins4 = axes[3].inset_axes([0.55, 0.03, 0.42, 0.42])
+    axins4.imshow(sr_crisp[cy_sr-crop_sr : cy_sr+crop_sr, cx_sr-crop_sr : cx_sr+crop_sr, :3], interpolation='lanczos')
+    axins4.set_title("3.3m Sub-Pixel Crop", fontsize=7, color='#00E5FF', pad=2)
+    axins4.set_xticks([]); axins4.set_yticks([])
+    for spine in axins4.spines.values(): 
+        spine.set_edgecolor('#00E5FF')
+        spine.set_linewidth(1.5)
 
     plt.tight_layout()
     comparison_path = OUTPUT_DIR / "end_to_end_pipeline_result.png"

@@ -10,7 +10,7 @@ from PIL import Image
 from model_cloud_cleanser import SAROpticalCloudCleanser
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CKPT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "cloud_cleanser_latest.pth")
+CKPT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "auraclear_weights_v3.pth")
 OUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 os.makedirs(OUT_DIR, exist_ok=True)
 DEFAULT_PROJECT = "liquid-galaxy-469819-j8"
